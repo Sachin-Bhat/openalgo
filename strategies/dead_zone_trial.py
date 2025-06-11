@@ -101,7 +101,7 @@ PRICE_TYPE = "MARKET"
 
 # Position and Risk Management Parameters
 MAX_POSITIONS = 5  # Maximum number of concurrent positions
-POSITION_SIZE = 1  # Number of shares per position
+POSITION_VALUE = 10000  # Amount to invest per position (₹10,000)
 STOP_LOSS_PCT = 0.02  # 2% stop loss
 TAKE_PROFIT_PCT = 0.04  # 4% take profit
 
@@ -1024,8 +1024,15 @@ def on_data_received(data):
         
         # Check stop loss and take profit for all active positions
         for position_id, position in list(active_positions.items()):
-            if ltp <= position['stoploss'] or ltp >= position['target']:
-                print(f"Exit Triggered for position {position_id}: LTP ₹{ltp} hit stoploss or target")
+            if ltp <= position['stoploss']:
+                print(f"Stop Loss Triggered for position {position_id}:")
+                print(f"Entry: ₹{position['entry_price']} | Current: ₹{ltp}")
+                print(f"Loss: ₹{round((ltp - position['entry_price']) * position['quantity'], 2)}")
+                exit_position(position_id)
+            elif ltp >= position['target']:
+                print(f"Target Hit for position {position_id}:")
+                print(f"Entry: ₹{position['entry_price']} | Current: ₹{ltp}")
+                print(f"Profit: ₹{round((ltp - position['entry_price']) * position['quantity'], 2)}")
                 exit_position(position_id)
 
 def websocket_thread():
@@ -1085,8 +1092,23 @@ def calculate_position_size():
             print(f"Insufficient balance: ₹{available_cash} < ₹{MIN_BALANCE}")
             return 0
             
-        # Use fixed position size since we're using market orders
-        return POSITION_SIZE
+        # Get current market price
+        quote = client.quotes(symbol=SYMBOL, exchange=EXCHANGE)
+        if quote.get('status') != 'success':
+            print(f"Error getting quote: {quote.get('message', 'Unknown error')}")
+            return 0
+            
+        current_price = float(quote['data']['ltp'])
+        
+        # Calculate number of shares based on fixed position value
+        quantity = int(POSITION_VALUE / current_price)
+        
+        # Ensure we're not exceeding available cash
+        if quantity * current_price > available_cash:
+            quantity = int(available_cash / current_price)
+            
+        print(f"Calculated position size: {quantity} shares at ₹{current_price} (Total: ₹{quantity * current_price})")
+        return quantity
         
     except Exception as e:
         print(f"Error calculating position size: {e}")
@@ -1123,12 +1145,24 @@ def place_live_order(action, position_id=None):
         
         if resp.get("status") == "success":
             order_id = resp.get("orderid")
-            time.sleep(1)
+            time.sleep(1)  # Wait for order to be processed
+            
+            # Get order status and execution details
             status = client.orderstatus(order_id=order_id, strategy=STRATEGY_NAME)
             data = status.get("data", {})
             
             if data.get("order_status", "").lower() == "complete":
-                entry_price = float(data["price"])
+                # Get the actual execution price from the order status
+                entry_price = float(data.get("average_price", 0))
+                if entry_price == 0:
+                    # If average_price is not available, try to get the last traded price
+                    quote = client.quotes(symbol=SYMBOL, exchange=EXCHANGE)
+                    if quote.get('status') == 'success':
+                        entry_price = float(quote['data']['ltp'])
+                    else:
+                        print("Warning: Could not get execution price, using last traded price")
+                        return
+                
                 stoploss_price = round(entry_price * (1 - STOP_LOSS_PCT), 2)
                 target_price = round(entry_price * (1 + TAKE_PROFIT_PCT), 2)
                 
@@ -1140,13 +1174,18 @@ def place_live_order(action, position_id=None):
                     'stoploss': stoploss_price,
                     'target': target_price,
                     'quantity': quantity,
-                    'order_id': order_id
+                    'order_id': order_id,
+                    'total_value': round(entry_price * quantity, 2)
                 }
                 
                 print(f"Position {position_id} opened:")
                 print(f"Entry @ ₹{entry_price} | SL ₹{stoploss_price} | Target ₹{target_price}")
+                print(f"Quantity: {quantity} shares | Total Value: ₹{active_positions[position_id]['total_value']}")
+            else:
+                print(f"Order not completed. Status: {data.get('order_status')}")
     except Exception as e:
         print(f"Error placing order: {e}")
+        print(traceback.format_exc())
 
 def exit_position(position_id):
     """Exit a specific position"""
@@ -1276,15 +1315,31 @@ def live_trading_thread():
     """Thread for live trading strategy"""
     while not stop_event.is_set():
         try:
+            # Print current positions
+            print(f"\nCurrent positions: {len(active_positions)}/{MAX_POSITIONS}")
+            for pos_id, pos in active_positions.items():
+                print(f"Position {pos_id}: {pos['action']} @ ₹{pos['entry_price']} | SL ₹{pos['stoploss']} | Target ₹{pos['target']}")
+            
             # Generate signal regardless of LTP
             signal = get_live_signal()
             if signal is not None:  # Only proceed if we got a valid signal
                 if signal == 1:  # Buy signal
                     print("Received BUY signal")
-                    place_live_order("BUY")
+                    if len(active_positions) < MAX_POSITIONS:
+                        place_live_order("BUY")
+                    else:
+                        print(f"Cannot take more positions. Current positions: {len(active_positions)}/{MAX_POSITIONS}")
                 elif signal == -1:  # Sell signal
                     print("Received SELL signal")
-                    place_live_order("SELL")
+                    # In CNC, we can only sell if we have existing long positions
+                    if active_positions:
+                        # Exit all existing long positions
+                        for position_id in list(active_positions.keys()):
+                            if active_positions[position_id]['action'] == "BUY":
+                                print(f"Exiting long position {position_id} due to SELL signal")
+                                exit_position(position_id)
+                    else:
+                        print("Cannot SELL: No existing long positions in CNC mode")
                 else:
                     print("No trading signal")
                     
