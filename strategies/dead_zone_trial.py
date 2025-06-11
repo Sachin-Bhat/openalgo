@@ -23,14 +23,53 @@ from openalgo import api
 import threading
 import signal
 from datetime import datetime, timedelta
+import traceback
+import logging
+import sys
+from functools import wraps
+import pickle
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('dead_zone_strategy.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger('DeadZoneStrategy')
+
+def signal_handler(signum, frame):
+    """Handle system signals for graceful shutdown"""
+    logger.info(f"Received signal {signum}. Initiating graceful shutdown...")
+    stop_event.set()
+    exit_all_positions()
+    sys.exit(0)
+
+# Register signal handlers
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
+
+def error_handler(func):
+    """Decorator for error handling and logging"""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            error_msg = f"Error in {func.__name__}: {str(e)}\n{traceback.format_exc()}"
+            logger.error(error_msg)
+            raise
+    return wrapper
 
 # %%
-START_DATE = "2009-01-01"
+START_DATE = "2017-07-03"
 END_DATE_TRAIN_VAL = "2018-12-31" # Training + Validation data ends here
 END_DATE_TEST = pd.Timestamp.now().strftime("%Y-%m-%d")      # Test data uses current date
 SYMBOL = "RELIANCE"
 EXCHANGE = "NSE"
-INTERVAL = "D"
+INTERVAL = "1m"
 
 # Target variable definition
 DEAD_ZONE_LOWER = -0.0010  # -0.10%
@@ -77,6 +116,7 @@ MAX_PORTFOLIO_RISK = 0.02  # Maximum 2% risk per trade
 ltp = None
 active_positions = {}  # Dictionary to track multiple positions
 stop_event = threading.Event()
+instrument = [{"exchange": EXCHANGE, "symbol": SYMBOL}]  # Define instrument at top level
 
 pl.config.Config.set_tbl_rows(100)
 
@@ -85,10 +125,12 @@ pl.config.Config.set_tbl_rows(100)
 client = api(
     api_key="917dd42d55f63ae8f00117abfbe5b05465fc3bd76a3efbee3be7c085df0be579",
     host="http://127.0.0.1:5000",
+    ws_url="ws://127.0.0.1:8765"
 )
 
 # %%
-def fetch_historical_data(client: api, symbol, exchange, interval, start_date, end_date, chunk_size=90, max_retries=3, retry_delay=5):
+@error_handler
+def fetch_historical_data(client: api, symbol, exchange, interval, start_date, end_date, chunk_size=90, max_retries=5, retry_delay=10):
     """
     Fetch historical data in chunks with retry logic and save to CSV.
     Will read from existing CSV if available and only fetch missing data.
@@ -100,22 +142,34 @@ def fetch_historical_data(client: api, symbol, exchange, interval, start_date, e
     start_dt = pd.to_datetime(start_date).tz_localize('UTC+05:30')
     end_dt = pd.to_datetime(end_date).tz_localize('UTC+05:30')
     
+    # Adjust chunk size based on interval
+    if interval == "1m" or interval == "5m" or interval == "15m" or interval == "30m":
+        chunk_size = 20  # For 1-minute data, fetch 20 days at a time
+    elif interval == "1h":
+        chunk_size = 30  # For hourly data, fetch 30 days at a time
+    else:  # Daily or larger intervals
+        chunk_size = 90  # Default chunk size for daily data
+    
     # Try to load existing data
     existing_data = None
     if os.path.exists(filename):
         print(f"Found existing data file: {filename}")
-        existing_data = pd.read_csv(filename, index_col=0, parse_dates=True)
-        # Ensure the index is timezone-aware
-        if not existing_data.empty and existing_data.index.tz is None:
-            existing_data.index = existing_data.index.tz_localize('UTC+05:30')
-        print(f"Loaded {len(existing_data)} existing records")
-        
-        # Update start_date if we have existing data
-        if not existing_data.empty:
-            last_date = existing_data.index.max()
-            if last_date >= start_dt:
-                start_dt = last_date + pd.Timedelta(days=1)
-                print(f"Updating start date to {start_dt.date()} based on existing data")
+        try:
+            existing_data = pd.read_csv(filename, index_col=0, parse_dates=True)
+            # Ensure the index is timezone-aware
+            if not existing_data.empty and existing_data.index.tz is None:
+                existing_data.index = existing_data.index.tz_localize('UTC+05:30')
+            print(f"Loaded {len(existing_data)} existing records")
+            
+            # Update start_date if we have existing data
+            if not existing_data.empty:
+                last_date = existing_data.index.max()
+                if last_date >= start_dt:
+                    start_dt = last_date + pd.Timedelta(minutes=1 if interval == "1m" else 1)
+                    print(f"Updating start date to {start_dt} based on existing data")
+        except Exception as e:
+            print(f"Error reading existing data file: {e}")
+            print("Will create new data file")
     
     # If we have all the data already, return it
     if existing_data is not None and start_dt >= end_dt:
@@ -127,10 +181,11 @@ def fetch_historical_data(client: api, symbol, exchange, interval, start_date, e
     if total_days <= 0:
         return existing_data
         
-    num_chunks = (total_days + chunk_size - 1) // chunk_size  # Ceiling division
+    # Calculate number of chunks based on max_days_per_request
+    num_chunks = (total_days + chunk_size - 1) // chunk_size
     
     print(f"Fetching {total_days} days of new data")
-    print(f"Breaking into {num_chunks} chunks of {chunk_size} days each")
+    print(f"Breaking into {num_chunks} chunks of max {chunk_size} days each")
     
     # Initialize empty list to store DataFrames
     dfs = []
@@ -145,6 +200,7 @@ def fetch_historical_data(client: api, symbol, exchange, interval, start_date, e
         print(f"Period: {chunk_start.date()} to {chunk_end.date()}")
         
         # Download data for this chunk with retry logic
+        chunk_success = False
         for attempt in range(max_retries):
             try:
                 print(f"Attempt {attempt + 1}/{max_retries} to fetch chunk data...")
@@ -155,99 +211,72 @@ def fetch_historical_data(client: api, symbol, exchange, interval, start_date, e
                     start_date=chunk_start.strftime("%Y-%m-%d"),
                     end_date=chunk_end.strftime("%Y-%m-%d"),
                 )
-                print("Chunk data fetched successfully!")
                 
-                if not chunk_data.empty:
-                    print(f"Columns in chunk data: {chunk_data.columns.tolist()}")
+                if chunk_data is not None and not chunk_data.empty:
+                    print(f"Chunk data fetched successfully! Got {len(chunk_data)} records")
+                    
+                    # Ensure timezone consistency
+                    if 'timestamp' in chunk_data.columns:
+                        chunk_data['timestamp'] = pd.to_datetime(chunk_data['timestamp'])
+                        if chunk_data['timestamp'].dt.tz is None:
+                            chunk_data['timestamp'] = chunk_data['timestamp'].dt.tz_localize('UTC+05:30')
+                        chunk_data.set_index('timestamp', inplace=True)
+                    elif chunk_data.index.name == 'timestamp':
+                        if chunk_data.index.tz is None:
+                            chunk_data.index = chunk_data.index.tz_localize('UTC+05:30')
+                    
                     dfs.append(chunk_data)
-                    chunk_dates.append((chunk_start, chunk_end))  # Store the date range
-                break
-                
+                    chunk_dates.append((chunk_start, chunk_end))
+                    chunk_success = True
+                    break
+                else:
+                    print("Received empty data for chunk")
+                    time.sleep(retry_delay)
+                    
             except Exception as e:
+                print(f"Error fetching chunk data (attempt {attempt + 1}): {str(e)}")
                 if attempt < max_retries - 1:
-                    print(f"Error fetching chunk data (attempt {attempt + 1}): {str(e)}")
                     print(f"Retrying in {retry_delay} seconds...")
                     time.sleep(retry_delay)
                 else:
-                    print(f"Failed to fetch chunk data after {max_retries} attempts: {str(e)}")
+                    print(f"Failed to fetch chunk data after {max_retries} attempts")
+                    # Save what we have so far
+                    if dfs:
+                        print("Saving partial data...")
+                        partial_data = pd.concat(dfs)
+                        if existing_data is not None:
+                            partial_data = pd.concat([existing_data, partial_data])
+                        partial_data = partial_data[~partial_data.index.duplicated(keep='first')]
+                        partial_data = partial_data.sort_index()
+                        os.makedirs('data', exist_ok=True)
+                        partial_data.to_csv(filename)
+                        print(f"Saved {len(partial_data)} records to {filename}")
                     raise
+        
+        if not chunk_success:
+            print(f"Failed to fetch chunk {chunk + 1} after all retries")
+            continue
+            
+        # Save progress after each successful chunk
+        if dfs:
+            print("Saving progress...")
+            progress_data = pd.concat(dfs)
+            if existing_data is not None:
+                progress_data = pd.concat([existing_data, progress_data])
+            progress_data = progress_data[~progress_data.index.duplicated(keep='first')]
+            progress_data = progress_data.sort_index()
+            os.makedirs('data', exist_ok=True)
+            progress_data.to_csv(filename)
+            print(f"Saved {len(progress_data)} records to {filename}")
     
     # Combine all chunks
     if dfs:
         new_data = pd.concat(dfs)
         print("\nColumns in new data:", new_data.columns.tolist())
         
-        # Find the timestamp column
-        timestamp_cols = [col for col in new_data.columns if 'time' in col.lower() or 'date' in col.lower()]
-        if timestamp_cols:
-            timestamp_col = timestamp_cols[0]
-            print(f"Using '{timestamp_col}' as timestamp column")
-            
-            # Set timestamp as index and sort
-            new_data = new_data.set_index(timestamp_col)
-            new_data = new_data.sort_index()
-        else:
-            print("No timestamp column found, generating timestamps based on interval...")
-            
-            # Parse interval to get minutes
-            if interval == 'D':  # Daily data
-                interval_minutes = 1440  # 24 hours in minutes
-            else:
-                # For intraday data, calculate minutes from interval
-                interval_minutes = int(interval.replace('m', '')) if 'm' in interval else int(interval.replace('h', '')) * 60
-            
-            # Generate timestamps for each chunk's data
-            all_timestamps = []
-            for i, (chunk_start, chunk_end) in enumerate(chunk_dates):
-                if interval == 'D':  # Daily data
-                    # For daily data, set timestamps to 9:15 AM IST for each day
-                    chunk_timestamps = pd.date_range(
-                        start=chunk_start.replace(hour=9, minute=15),
-                        end=chunk_end.replace(hour=9, minute=15),
-                        freq='D',
-                        tz='UTC+05:30'
-                    )
-                else:
-                    # For intraday data
-                    market_open = pd.Timestamp(chunk_start).replace(hour=9, minute=15, tz='UTC+05:30')
-                    market_close = pd.Timestamp(chunk_start).replace(hour=15, minute=30, tz='UTC+05:30')
-                    
-                    # Generate timestamps for each trading day in the chunk
-                    chunk_timestamps = []
-                    current_date = chunk_start
-                    while current_date <= chunk_end:
-                        if current_date.weekday() < 5:  # Only weekdays
-                            day_timestamps = pd.date_range(
-                                start=market_open,
-                                end=market_close,
-                                freq=f'{interval_minutes}T',
-                                tz='UTC+05:30'
-                            )
-                            chunk_timestamps.extend(day_timestamps)
-                        current_date += pd.Timedelta(days=1)
-                    chunk_timestamps = pd.DatetimeIndex(chunk_timestamps)
-                
-                # Get the number of rows in this chunk
-                chunk_size = len(dfs[i])
-                if len(chunk_timestamps) >= chunk_size:
-                    all_timestamps.extend(chunk_timestamps[:chunk_size])
-                else:
-                    print(f"Warning: Not enough timestamps for chunk {i+1}")
-                    # Pad with additional timestamps if needed
-                    additional_timestamps = pd.date_range(
-                        start=chunk_timestamps[-1] + pd.Timedelta(minutes=interval_minutes),
-                        periods=chunk_size - len(chunk_timestamps),
-                        freq=f'{interval_minutes}T',
-                        tz='UTC+05:30'
-                    )
-                    all_timestamps.extend(list(chunk_timestamps) + list(additional_timestamps))
-            
-            # Set the timestamps as index
-            new_data.index = pd.DatetimeIndex(all_timestamps)
-            new_data = new_data.sort_index()
-        
-        # Remove duplicates
+        # Remove duplicates and sort
         new_data = new_data[~new_data.index.duplicated(keep='first')]
+        new_data = new_data.sort_index()
         
         print(f"\nSuccessfully combined {len(dfs)} chunks into new dataset")
         print(f"New records: {len(new_data)}")
@@ -272,6 +301,7 @@ def fetch_historical_data(client: api, symbol, exchange, interval, start_date, e
         return existing_data if existing_data is not None else pd.DataFrame()
 
 # %%
+@error_handler
 def prepare_target_variable(data_full, dead_zone_upper, dead_zone_lower):
     """
     Prepare the target variable for the trading strategy by calculating returns and labeling trends.
@@ -320,6 +350,7 @@ def prepare_target_variable(data_full, dead_zone_upper, dead_zone_lower):
 # data_full = prepare_target_variable(data_full, DEAD_ZONE_UPPER, DEAD_ZONE_LOWER)
 
 # %%
+@error_handler
 def engineer_features(data_full):
     """
     Engineer technical indicators and features for the trading strategy.
@@ -336,92 +367,119 @@ def engineer_features(data_full):
         - data_full is the DataFrame with engineered features
         - initial_features is a list of feature column names
     """
-    # Price-based features
-    data_full['H-L'] = data_full['high'] - data_full['low']
-    data_full['C-O'] = data_full['close'] - data_full['open']
-    data_full['Amplitude'] = (data_full['high'] - data_full['low']) / data_full['close'].shift(1)
-    data_full['Difference'] = (data_full['close'] - data_full['open']) / data_full['close'].shift(1)
-    data_full['High_Low_Range'] = data_full['high'] - data_full['low']
-    data_full['Open_Close_Range'] = data_full['open'] - data_full['close']
+    try:
+        # Validate input data
+        if data_full is None:
+            raise ValueError("Input DataFrame is None")
+        if not isinstance(data_full, pd.DataFrame):
+            raise ValueError(f"Input must be a pandas DataFrame, got {type(data_full)}")
+        if data_full.empty:
+            raise ValueError("Input DataFrame is empty")
+        if not all(col in data_full.columns for col in ['open', 'high', 'low', 'close', 'volume']):
+            raise ValueError("Input DataFrame must contain 'open', 'high', 'low', 'close', and 'volume' columns")
 
-    # Bollinger Bands
-    data_full['BB_lower'], data_full['BB_middle'], data_full['BB_upper'] = BBands(data_full['close'], lookback=20)
-    data_full['BB_width'] = data_full['BB_upper'] - data_full['BB_lower']
+        # Price-based features
+        data_full['H-L'] = data_full['high'] - data_full['low']
+        data_full['C-O'] = data_full['close'] - data_full['open']
+        data_full['Amplitude'] = (data_full['high'] - data_full['low']) / data_full['close'].shift(1)
+        data_full['Difference'] = (data_full['close'] - data_full['open']) / data_full['close'].shift(1)
+        data_full['High_Low_Range'] = data_full['high'] - data_full['low']
+        data_full['Open_Close_Range'] = data_full['open'] - data_full['close']
 
-    # Lagged Returns
-    for lag in [1, 2, 3, 5, 10]:
-        data_full[f'Return_lag{lag}'] = data_full['Return'].shift(lag)
+        # Bollinger Bands
+        data_full['BB_lower'], data_full['BB_middle'], data_full['BB_upper'] = BBands(data_full['close'], lookback=20)
+        data_full['BB_width'] = data_full['BB_upper'] - data_full['BB_lower']
 
-    # Moving Averages & Differentials
-    for ma_period in [10, 20, 50]:
-        data_full[f'SMA{ma_period}'] = ta.sma(data_full['close'], length=ma_period)
-        data_full[f'EMA{ma_period}'] = ta.ema(data_full['close'], length=ma_period)
-        data_full[f'Close_vs_SMA{ma_period}'] = data_full['close'] - data_full[f'SMA{ma_period}']
-        data_full[f'Close_vs_EMA{ma_period}'] = data_full['close'] - data_full[f'EMA{ma_period}']
+        # Lagged Returns
+        for lag in [1, 2, 3, 5, 10]:
+            data_full[f'Return_lag{lag}'] = data_full['Return'].shift(lag)
 
-    if 'SMA10' in data_full and 'SMA20' in data_full:
-        data_full['SMA10_vs_SMA20'] = data_full['SMA10'] - data_full['SMA20']
-    if 'EMA10' in data_full and 'EMA20' in data_full:
-        data_full['EMA10_vs_EMA20'] = data_full['EMA10'] - data_full['EMA20']
+        # Moving Averages & Differentials
+        for ma_period in [10, 20, 50]:
+            data_full[f'SMA{ma_period}'] = ta.sma(data_full['close'], length=ma_period)
+            data_full[f'EMA{ma_period}'] = ta.ema(data_full['close'], length=ma_period)
+            data_full[f'Close_vs_SMA{ma_period}'] = data_full['close'] - data_full[f'SMA{ma_period}']
+            data_full[f'Close_vs_EMA{ma_period}'] = data_full['close'] - data_full[f'EMA{ma_period}']
 
-    # Volatility Indicators
-    data_full['ATR14'] = ta.atr(data_full['high'], data_full['low'], data_full['close'], length=14)
-    data_full['StdDev20_Return'] = data_full['Return'].rolling(window=20).std()
+        if 'SMA10' in data_full and 'SMA20' in data_full:
+            data_full['SMA10_vs_SMA20'] = data_full['SMA10'] - data_full['SMA20']
+        if 'EMA10' in data_full and 'EMA20' in data_full:
+            data_full['EMA10_vs_EMA20'] = data_full['EMA10'] - data_full['EMA20']
 
-    # Momentum Indicators
-    data_full['RSI14'] = ta.rsi(data_full['close'], length=14)
-    macd_df = ta.macd(data_full['close'], fast=12, slow=26, signal=9)
-    data_full['MACD'] = macd_df['MACD_12_26_9']
-    data_full['MACD_signal'] = macd_df['MACDs_12_26_9']
-    data_full['MACD_hist'] = macd_df['MACDh_12_26_9']
-    
-    data_full['Momentum10'] = data_full['close'] - data_full['close'].shift(10)
-    data_full['Williams_%R'] = -100 * (data_full['high'] - data_full['close']) / (data_full['high'] - data_full['low'])
-    data_full['Williams%R14'] = ta.willr(data_full['high'], data_full['low'], data_full['close'], length=14)
+        # Volatility Indicators
+        data_full['ATR14'] = ta.atr(data_full['high'], data_full['low'], data_full['close'], length=14)
+        data_full['StdDev20_Return'] = data_full['Return'].rolling(window=20).std()
 
-    # Stochastic Oscillator
-    stoch_df = ta.stoch(data_full['high'], data_full['low'], data_full['close'], k=14, d=3, smooth_k=3, mamode='sma')
-    data_full['Stochastic_K'] = stoch_df['STOCHk_14_3_3']
-    data_full['Stochastic_D'] = stoch_df['STOCHd_14_3_3']
+        # Momentum Indicators
+        data_full['RSI14'] = ta.rsi(data_full['close'], length=14)
+        
+        # MACD calculation with error handling
+        try:
+            macd_df = ta.macd(data_full['close'], fast=12, slow=26, signal=9)
+            if macd_df is not None and not macd_df.empty:
+                data_full['MACD'] = macd_df['MACD_12_26_9']
+                data_full['MACD_signal'] = macd_df['MACDs_12_26_9']
+                data_full['MACD_hist'] = macd_df['MACDh_12_26_9']
+            else:
+                logger.warning("MACD calculation returned None or empty DataFrame. Skipping MACD features.")
+        except Exception as e:
+            logger.warning(f"Error calculating MACD: {str(e)}. Skipping MACD features.")
+        
+        data_full['Momentum10'] = data_full['close'] - data_full['close'].shift(10)
+        data_full['Williams_%R'] = -100 * (data_full['high'] - data_full['close']) / (data_full['high'] - data_full['low'])
+        data_full['Williams%R14'] = ta.willr(data_full['high'], data_full['low'], data_full['close'], length=14)
 
-    # Rate of Change
-    data_full['ROC10'] = data_full['close'].pct_change(periods=10)
+        # Stochastic Oscillator
+        try:
+            stoch_df = ta.stoch(data_full['high'], data_full['low'], data_full['close'], k=14, d=3, smooth_k=3, mamode='sma')
+            if stoch_df is not None and not stoch_df.empty:
+                data_full['Stochastic_K'] = stoch_df['STOCHk_14_3_3']
+                data_full['Stochastic_D'] = stoch_df['STOCHd_14_3_3']
+            else:
+                logger.warning("Stochastic calculation returned None or empty DataFrame. Skipping Stochastic features.")
+        except Exception as e:
+            logger.warning(f"Error calculating Stochastic: {str(e)}. Skipping Stochastic features.")
 
-    # On-Balance Volume
-    data_full['OBV'] = ta.obv(data_full['close'], data_full['volume'])
+        # Rate of Change
+        data_full['ROC10'] = data_full['close'].pct_change(periods=10)
 
-    # Volume-based features
-    data_full['Volume_MA5'] = ta.sma(data_full['volume'], length=5)
-    data_full['Volume_MA20'] = ta.sma(data_full['volume'], length=20)
-    data_full['Volume_Change'] = data_full['volume'].pct_change()
-    if 'Volume_MA5' in data_full and 'Volume_MA20' in data_full:
-        data_full['Volume_MA5_vs_MA20'] = data_full['Volume_MA5'] - data_full['Volume_MA20']
+        # On-Balance Volume
+        data_full['OBV'] = ta.obv(data_full['close'], data_full['volume'])
 
-    # Date/Time Features
-    data_full['DayOfWeek'] = data_full.index.dayofweek  # Monday=0, Sunday=6
-    data_full['Month'] = data_full.index.month
+        # Volume-based features
+        data_full['Volume_MA5'] = ta.sma(data_full['volume'], length=5)
+        data_full['Volume_MA20'] = ta.sma(data_full['volume'], length=20)
+        data_full['Volume_Change'] = data_full['volume'].pct_change()
+        if 'Volume_MA5' in data_full and 'Volume_MA20' in data_full:
+            data_full['Volume_MA5_vs_MA20'] = data_full['Volume_MA5'] - data_full['Volume_MA20']
 
-    # Ensure all features are numerical
-    for col in data_full.columns:
-        if data_full[col].dtype == 'object':
-            try:
-                data_full[col] = pd.to_numeric(data_full[col])
-            except Exception as e:
-                print(f"Error converting column {col}: {e}")
-                print(f"Warning: Could not convert column {col} to numeric. Dropping it.")
-                data_full = data_full.drop(columns=[col])
+        # Date/Time Features
+        data_full['DayOfWeek'] = data_full.index.dayofweek  # Monday=0, Sunday=6
+        data_full['Month'] = data_full.index.month
 
-    # Drop rows with NaNs created by indicators/lags
-    initial_features = data_full.columns.drop(['open', 'high', 'low', 'close', 'volume', 'Return', 'Uptrend'])
-    print(data_full.isnull().sum())
-    data_full.dropna(subset=initial_features, inplace=True)
-    print(f"Data shape after feature engineering and NaN drop: {data_full.shape}")
-    print(f"Number of initial features: {len(initial_features)}")
-    
-    return data_full, initial_features
+        # Ensure all features are numerical
+        for col in data_full.columns:
+            if data_full[col].dtype == 'object':
+                try:
+                    data_full[col] = pd.to_numeric(data_full[col])
+                except Exception as e:
+                    logger.warning(f"Error converting column {col} to numeric: {str(e)}. Dropping it.")
+                    data_full = data_full.drop(columns=[col])
 
+        # Drop rows with NaNs created by indicators/lags
+        initial_features = data_full.columns.drop(['open', 'high', 'low', 'close', 'volume', 'Return', 'Uptrend'])
+        logger.info(f"NaN counts before dropping:\n{data_full.isnull().sum()}")
+        data_full.dropna(subset=initial_features, inplace=True)
+        logger.info(f"Data shape after feature engineering and NaN drop: {data_full.shape}")
+        logger.info(f"Number of initial features: {len(initial_features)}")
+        
+        return data_full, initial_features
+    except Exception as e:
+        logger.error(f"Error in engineer_features: {str(e)}\n{traceback.format_exc()}")
+        raise
 
 # %%
+@error_handler
 def split_data(data_full, initial_features, end_date_train_val):
     """
     Split data into training, validation and test sets.
@@ -488,6 +546,7 @@ def validate_features(X):
     return X
 
 # %%
+@error_handler
 def scale_features(X_train, X_val, X_test):
     """
     Clean, validate and scale features using StandardScaler.
@@ -527,6 +586,7 @@ def scale_features(X_train, X_val, X_test):
     return X_train_scaled_df, X_val_scaled_df, X_test_scaled_df, scaler
 
 # %%
+@error_handler
 def select_features(X_train_scaled_df, X_val_scaled_df, X_test_scaled_df, y_train):
     """
     Perform feature selection using a funnel approach with multiple methods.
@@ -671,6 +731,7 @@ def select_features(X_train_scaled_df, X_val_scaled_df, X_test_scaled_df, y_trai
 
 
 # %%
+@error_handler
 def tune_and_train_model(X_train_final, X_val_final, y_train, y_val, random_seed, n_optuna_trials, optuna_cv_splits):
     """
     Tune hyperparameters using Optuna and train final model on combined train+val data.
@@ -747,6 +808,7 @@ def tune_and_train_model(X_train_final, X_val_final, y_train, y_val, random_seed
     return tuned_model, best_params
 
 # %%
+@error_handler
 def evaluate_model(tuned_model, X_test_final, y_test, display_plot=True):
     """
     Evaluate the model on test data and optionally display confusion matrix plot.
@@ -801,6 +863,7 @@ def evaluate_model(tuned_model, X_test_final, y_test, display_plot=True):
     }
 
 # %%
+@error_handler
 def run_backtest(test_df, y_pred_test_proba, symbol, backtest_prob_threshold=0.5, risk_free_rate_annual=0.05, 
                 display_plot=True, save_dir="."):
     """
@@ -951,39 +1014,61 @@ def run_backtest(test_df, y_pred_test_proba, symbol, backtest_prob_threshold=0.5
     return results
 
 # %%
-print("--- 1. Data Acquisition and Initial Preparation ---")
-# Call the function
-data_full = fetch_historical_data(
-    client=client,
-    symbol=SYMBOL,
-    exchange=EXCHANGE,
-    interval=INTERVAL,
-    start_date=START_DATE,
-    end_date=END_DATE_TEST
-)
+def on_data_received(data):
+    """WebSocket LTP Handler"""
+    global ltp
+    print(f"Received WebSocket data: {data}")  # Debug log
+    if data.get("type") == "market_data" and data.get("symbol") == SYMBOL:
+        ltp = float(data["data"]["ltp"])
+        print(f"LTP Update {EXCHANGE}:{SYMBOL} => ₹{ltp}")
+        
+        # Check stop loss and take profit for all active positions
+        for position_id, position in list(active_positions.items()):
+            if ltp <= position['stoploss'] or ltp >= position['target']:
+                print(f"Exit Triggered for position {position_id}: LTP ₹{ltp} hit stoploss or target")
+                exit_position(position_id)
 
-data_full = prepare_target_variable(data_full, DEAD_ZONE_UPPER, DEAD_ZONE_LOWER)
-
-print("\n--- 2. Feature Engineering ---")
-data_full, initial_features = engineer_features(data_full)
-
-print("\n--- 3. Train/Validation/Test Split ---")
-X_train, y_train, X_val, y_val, X_test, y_test, train_df, val_df, test_df = split_data(data_full, initial_features, END_DATE_TRAIN_VAL)
-
-print("\n--- 4. Feature Scaling ---")
-X_train_scaled_df, X_val_scaled_df, X_test_scaled_df, scaler = scale_features(X_train, X_val, X_test)
-
-print("\n--- 5. Feature Selection Funnelling Approach ---")
-X_train_final, X_val_final, X_test_final, final_selected_features = select_features(X_train_scaled_df, X_val_scaled_df, X_test_scaled_df, y_train)
-
-print("\n--- 6. Model Building and Hyperparameter Tuning ---")
-tuned_model, best_params = tune_and_train_model(X_train_final, X_val_final, y_train, y_val, RANDOM_SEED, N_OPTUNA_TRIALS, OPTUNA_CV_SPLITS)
-
-print("\n--- 7. Model Evaluation on Test Set ---")
-eval_result = evaluate_model(tuned_model, X_test_final, y_test, display_plot=False)
-
-print("\n--- 8. Backtesting the Predicted Signals ---")
-backtest_results = run_backtest(test_df, eval_result.get("probabilities"), SYMBOL, BACKTEST_PROB_THRESHOLD, RISK_FREE_RATE_ANNUAL, display_plot=False)
+def websocket_thread():
+    """WebSocket Thread for live price updates"""
+    reconnect_attempts = 0
+    max_reconnect_attempts = 5
+    reconnect_delay = 5  # seconds
+    
+    while not stop_event.is_set():
+        try:
+            print("Connecting to WebSocket...")
+            client.connect()
+            print("WebSocket connected successfully")
+            
+            print(f"Subscribing to LTP for {instrument}")
+            client.subscribe_ltp(instrument, on_data_received=on_data_received)
+            print("WebSocket LTP thread started.")
+            
+            # Reset reconnect attempts on successful connection
+            reconnect_attempts = 0
+            
+            # Keep the connection alive
+            while not stop_event.is_set():
+                time.sleep(1)
+                
+        except Exception as e:
+            print(f"WebSocket error: {str(e)}")
+            reconnect_attempts += 1
+            
+            if reconnect_attempts >= max_reconnect_attempts:
+                print(f"Failed to connect after {max_reconnect_attempts} attempts. Stopping WebSocket thread.")
+                break
+                
+            print(f"Attempting to reconnect in {reconnect_delay} seconds... (Attempt {reconnect_attempts}/{max_reconnect_attempts})")
+            time.sleep(reconnect_delay)
+            
+    print("Shutting down WebSocket...")
+    try:
+        client.unsubscribe_ltp(instrument)
+        client.disconnect()
+    except Exception as e:
+        print(f"Error cleaning up WebSocket connection: {e}")
+    print("WebSocket connection closed.")
 
 def calculate_position_size():
     """Calculate position size based on risk management parameters"""
@@ -1000,21 +1085,9 @@ def calculate_position_size():
             print(f"Insufficient balance: ₹{available_cash} < ₹{MIN_BALANCE}")
             return 0
             
-        # Calculate maximum position size based on risk
-        max_risk_amount = available_cash * MAX_PORTFOLIO_RISK
-        max_position_size = max_risk_amount / (ltp * STOP_LOSS_PCT)
+        # Use fixed position size since we're using market orders
+        return POSITION_SIZE
         
-        # Limit position size based on cash constraints
-        max_cash_position = min(MAX_CASH_PER_TRADE, available_cash) / ltp
-        
-        # Take the minimum of all constraints
-        position_size = min(
-            POSITION_SIZE,
-            max_position_size,
-            max_cash_position
-        )
-        
-        return int(position_size)
     except Exception as e:
         print(f"Error calculating position size: {e}")
         return 0
@@ -1108,144 +1181,343 @@ def exit_all_positions():
     for position_id in list(active_positions.keys()):
         exit_position(position_id)
 
-def on_data_received(data):
-    """WebSocket LTP Handler"""
-    global ltp
-    if data.get("type") == "market_data" and data.get("symbol") == SYMBOL:
-        ltp = float(data["data"]["ltp"])
-        print(f"LTP Update {EXCHANGE}:{SYMBOL} => ₹{ltp}")
-        
-        # Check stop loss and take profit for all active positions
-        for position_id, position in active_positions.items():
-            if ltp <= position['stoploss'] or ltp >= position['target']:
-                print(f"Exit Triggered for position {position_id}: LTP ₹{ltp} hit stoploss or target")
-                exit_position(position_id)
-
-def websocket_thread():
-    """WebSocket Thread for live price updates"""
-    try:
-        client.connect()
-        client.subscribe_ltp([{"exchange": EXCHANGE, "symbol": SYMBOL}], on_data_received=on_data_received)
-        print("WebSocket LTP thread started.")
-        while not stop_event.is_set():
-            time.sleep(1)
-    finally:
-        print("Shutting down WebSocket...")
-        client.unsubscribe_ltp([{"exchange": EXCHANGE, "symbol": SYMBOL}])
-        client.disconnect()
-        print("WebSocket connection closed.")
-
+@error_handler
 def get_live_signal():
-    """Get trading signal from the model for live trading"""
+    """Get live trading signal"""
     try:
+        print("\nFetching historical data for signal generation...")
+        # Fetch historical data - using simpler approach like ema_crossover_target.py
         end_date = datetime.now()
-        start_date = end_date - timedelta(days=3)
-        
+        start_date = end_date - timedelta(days=7)  # Get 7 days of data
+
         df = client.history(
             symbol=SYMBOL,
             exchange=EXCHANGE,
-            interval="5m",
+            interval=INTERVAL,
             start_date=start_date.strftime("%Y-%m-%d"),
             end_date=end_date.strftime("%Y-%m-%d")
         )
         
+        if df is None:
+            print("Error: No historical data received")
+            return None
+            
+        print(f"Received {len(df)} rows of historical data")
+        print(f"Data range: {df.index.min()} to {df.index.max()}")
+        
+        if len(df) < 50:  # Need enough data for indicators
+            print(f"Warning: Not enough data points ({len(df)} < 50 required)")
+            return None
+            
+        print("Preparing features for prediction...")
         # Prepare features for prediction
         df = prepare_target_variable(df, DEAD_ZONE_UPPER, DEAD_ZONE_LOWER)
-        df, _ = engineer_features(df)
+        df, initial_features = engineer_features(df)
         
-        # Select only the features used in training
-        features = df[final_selected_features].iloc[-1:].copy()
+        # Log all available features
+        logger.info(f"Available features after engineering: {len(df.columns)}")
+        logger.info(f"Features: {df.columns.tolist()}")
+        
+        # Debug: Print the final_selected_features
+        logger.info(f"Expected features from model: {len(final_selected_features)}")
+        logger.info(f"Expected features list: {final_selected_features}")
+        
+        # Create a DataFrame with all required features in the same order as training
+        features = pd.DataFrame(index=df.index[-1:])
+        
+        # First, check if all required features exist
+        missing_features = set(final_selected_features) - set(df.columns)
+        if missing_features:
+            print(f"Error: Missing required features: {missing_features}")
+            return None
+            
+        print("All required features available, preparing final feature set...")
+        # Then, add only the required features in the correct order
+        for feature in final_selected_features:
+            features[feature] = df[feature].iloc[-1:]
+            
+        # Verify the features DataFrame
+        logger.info(f"Features DataFrame shape: {features.shape}")
+        logger.info(f"Features DataFrame columns: {features.columns.tolist()}")
+        
+        # Log feature values for debugging
+        logger.info("Feature values for prediction:")
+        for feature in features.columns:
+            print(f"{feature}: {features[feature].iloc[0]}")
+        
+        # Create a new scaler with only the selected features
+        selected_scaler = StandardScaler()
+        selected_scaler.fit(features)
         
         # Scale features
-        features_scaled = scaler.transform(features)
+        features_scaled = selected_scaler.transform(features)
         
-        # Get prediction probability
-        prob = tuned_model.predict_proba(features_scaled)[0][1]
-        print(f"Signal probability: {prob:.4f}")
+        # Get prediction
+        prediction = tuned_model.predict_proba(features_scaled)[0]
+        print(f"Prediction probabilities: {prediction}")
         
-        if prob > BACKTEST_PROB_THRESHOLD:
-            return "BUY"
-        elif prob < (1 - BACKTEST_PROB_THRESHOLD):
-            return "SELL"
-        return None
+        # Return signal based on prediction
+        if prediction[1] > BACKTEST_PROB_THRESHOLD:
+            print("Generated BUY signal")
+            return 1  # Buy signal
+        elif prediction[0] > BACKTEST_PROB_THRESHOLD:
+            print("Generated SELL signal")
+            return -1  # Sell signal
+        else:
+            print("No trading signal generated")
+            return 0  # No signal
+            
     except Exception as e:
-        print(f"Error getting live trading signal: {e}")
+        logger.error(f"Error getting live trading signal: {str(e)}")
+        logger.error(traceback.format_exc())
         return None
 
 def live_trading_thread():
     """Thread for live trading strategy"""
     while not stop_event.is_set():
         try:
+            # Generate signal regardless of LTP
             signal = get_live_signal()
-            if signal:
-                place_live_order(signal)
+            if signal is not None:  # Only proceed if we got a valid signal
+                if signal == 1:  # Buy signal
+                    print("Received BUY signal")
+                    place_live_order("BUY")
+                elif signal == -1:  # Sell signal
+                    print("Received SELL signal")
+                    place_live_order("SELL")
+                else:
+                    print("No trading signal")
+                    
             time.sleep(300)  # Check for signals every 5 minutes
+            
         except Exception as e:
-            print(f"Error in live trading thread: {e}")
-            time.sleep(60)
+            logger.error(f"Error in live trading thread: {str(e)}\n{traceback.format_exc()}")
+            time.sleep(60)  # Wait before retrying
 
-def run_live_trading():
-    """Run the strategy in live trading mode"""
-    print("Starting Dead Zone Strategy in live trading mode...")
-    
-    # Start threads
-    ws_thread = threading.Thread(target=websocket_thread)
-    trading_thread = threading.Thread(target=live_trading_thread)
-    
-    ws_thread.start()
-    trading_thread.start()
-    
+def save_model_artifacts(tuned_model: XGBClassifier, scaler: StandardScaler, final_selected_features: list, best_params: dict, save_dir: str = "model_artifacts"):
+    """Save model artifacts for live trading"""
     try:
-        while True:
-            time.sleep(1)
+        # Create save directory if it doesn't exist
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # Save the model
+        model_path = os.path.join(save_dir, "model.json")
+        tuned_model.save_model(model_path)
+        
+        # Create a new scaler with only the selected features
+        selected_scaler = StandardScaler()
+        
+        # Get the original scaler's parameters
+        original_means = scaler.mean_
+        original_scales = scaler.scale_
+        
+        # Create a new scaler with the same parameters for selected features
+        selected_scaler.mean_ = original_means
+        selected_scaler.scale_ = original_scales
+        selected_scaler.n_features_in_ = len(final_selected_features)
+        
+        # Save the scaler
+        scaler_path = os.path.join(save_dir, "scaler.pkl")
+        with open(scaler_path, 'wb') as f:
+            pickle.dump(selected_scaler, f)
+        
+        # Save selected features with metadata
+        features_metadata = {
+            'features': final_selected_features,
+            'feature_count': len(final_selected_features),
+            'feature_order': list(final_selected_features),
+            'timestamp': datetime.now().isoformat()
+        }
+        features_path = os.path.join(save_dir, "selected_features.pkl")
+        with open(features_path, 'wb') as f:
+            pickle.dump(features_metadata, f)
+        
+        # Save best parameters
+        params_path = os.path.join(save_dir, "best_params.pkl")
+        with open(params_path, 'wb') as f:
+            pickle.dump(best_params, f)
+            
+        # Save feature engineering parameters
+        feature_params = {
+            'CORRELATION_THRESHOLD': CORRELATION_THRESHOLD,
+            'VIF_THRESHOLD': VIF_THRESHOLD,
+            'N_UNIVARIATE_FEATURES': N_UNIVARIATE_FEATURES,
+            'N_XGB_IMPORTANCE_FEATURES': N_XGB_IMPORTANCE_FEATURES,
+            'RFECV_MIN_FEATURES': RFECV_MIN_FEATURES
+        }
+        feature_params_path = os.path.join(save_dir, "feature_params.pkl")
+        with open(feature_params_path, 'wb') as f:
+            pickle.dump(feature_params, f)
+            
+        logger.info(f"Model artifacts saved to {save_dir}")
+        logger.info(f"Number of selected features: {len(final_selected_features)}")
+        logger.info(f"Selected features: {final_selected_features}")
+        logger.info(f"Scaler feature count: {selected_scaler.n_features_in_}")
+        
+    except Exception as e:
+        logger.error(f"Error saving model artifacts: {str(e)}")
+        raise
+
+def load_model_artifacts(save_dir="model_artifacts"):
+    """Load model artifacts for live trading"""
+    try:
+        # Load the model
+        model_path = os.path.join(save_dir, "model.json")
+        model = XGBClassifier()
+        model.load_model(model_path)
+        
+        # Load the scaler
+        scaler_path = os.path.join(save_dir, "scaler.pkl")
+        with open(scaler_path, 'rb') as f:
+            scaler = pickle.load(f)
+        
+        # Load selected features with metadata
+        features_path = os.path.join(save_dir, "selected_features.pkl")
+        with open(features_path, 'rb') as f:
+            features_metadata = pickle.load(f)
+        
+        # Load best parameters
+        params_path = os.path.join(save_dir, "best_params.pkl")
+        with open(params_path, 'rb') as f:
+            best_params = pickle.load(f)
+            
+        # Load feature engineering parameters
+        feature_params_path = os.path.join(save_dir, "feature_params.pkl")
+        with open(feature_params_path, 'rb') as f:
+            feature_params = pickle.load(f)
+            
+        # Extract features
+        final_selected_features = features_metadata['features']
+        
+        # Verify feature counts
+        logger.info(f"Model artifacts loaded from {save_dir}")
+        logger.info(f"Number of selected features: {len(final_selected_features)}")
+        logger.info(f"Selected features: {final_selected_features}")
+        logger.info(f"Feature engineering parameters: {feature_params}")
+        logger.info(f"Scaler feature count: {scaler.n_features_in_}")
+        
+        # Verify feature counts match
+        if len(final_selected_features) != scaler.n_features_in_:
+            logger.error(f"Feature count mismatch: selected features ({len(final_selected_features)}) != scaler features ({scaler.n_features_in_})")
+            raise ValueError("Feature count mismatch between selected features and scaler")
+        
+        return model, scaler, final_selected_features, best_params
+    except Exception as e:
+        logger.error(f"Error loading model artifacts: {str(e)}")
+        raise
+
+if __name__ == "__main__":
+    try:
+        # Check if we want to run backtesting or live trading
+        import sys
+        if len(sys.argv) > 1 and sys.argv[1] == "--live":
+            logger.info("Starting Dead Zone Strategy in live trading mode...")
+            
+            # Load model artifacts for live trading
+            try:
+                tuned_model, scaler, final_selected_features, best_params = load_model_artifacts()
+                logger.info("Successfully loaded model artifacts for live trading")
+            except Exception as e:
+                logger.error(f"Failed to load model artifacts: {str(e)}")
+                logger.info("Running backtesting first to prepare model...")
+                
+                # Run backtesting to prepare model
+                print("--- 1. Data Acquisition and Initial Preparation ---")
+                data_full = fetch_historical_data(
+                    client=client,
+                    symbol=SYMBOL,
+                    exchange=EXCHANGE,
+                    interval=INTERVAL,
+                    start_date=START_DATE,
+                    end_date=END_DATE_TEST
+                )
+                
+                data_full = prepare_target_variable(data_full, DEAD_ZONE_UPPER, DEAD_ZONE_LOWER)
+                
+                print("\n--- 2. Feature Engineering ---")
+                data_full, initial_features = engineer_features(data_full)
+                
+                print("\n--- 3. Train/Validation/Test Split ---")
+                X_train, y_train, X_val, y_val, X_test, y_test, train_df, val_df, test_df = split_data(data_full, initial_features, END_DATE_TRAIN_VAL)
+                
+                print("\n--- 4. Feature Scaling ---")
+                X_train_scaled_df, X_val_scaled_df, X_test_scaled_df, scaler = scale_features(X_train, X_val, X_test)
+                
+                print("\n--- 5. Feature Selection Funnelling Approach ---")
+                X_train_final, X_val_final, X_test_final, final_selected_features = select_features(X_train_scaled_df, X_val_scaled_df, X_test_scaled_df, y_train)
+                
+                print("\n--- 6. Model Building and Hyperparameter Tuning ---")
+                tuned_model, best_params = tune_and_train_model(X_train_final, X_val_final, y_train, y_val, RANDOM_SEED, N_OPTUNA_TRIALS, OPTUNA_CV_SPLITS)
+                
+                # Save model artifacts
+                save_model_artifacts(tuned_model, scaler, final_selected_features, best_params)
+            
+            logger.info("Starting live trading...")
+            
+            # Start live trading
+            ws_thread = threading.Thread(target=websocket_thread)
+            trading_thread = threading.Thread(target=live_trading_thread)
+            
+            ws_thread.start()
+            trading_thread.start()
+            
+            try:
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                logger.info("KeyboardInterrupt received. Shutting down...")
+                stop_event.set()
+                exit_all_positions()
+                ws_thread.join()
+                trading_thread.join()
+                logger.info("Strategy shutdown complete.")
+        else:
+            logger.info("Starting Dead Zone Strategy in backtesting mode...")
+            # Run the existing backtesting code
+            print("--- 1. Data Acquisition and Initial Preparation ---")
+            data_full = fetch_historical_data(
+                client=client,
+                symbol=SYMBOL,
+                exchange=EXCHANGE,
+                interval=INTERVAL,
+                start_date=START_DATE,
+                end_date=END_DATE_TEST
+            )
+            
+            data_full = prepare_target_variable(data_full, DEAD_ZONE_UPPER, DEAD_ZONE_LOWER)
+            
+            print("\n--- 2. Feature Engineering ---")
+            data_full, initial_features = engineer_features(data_full)
+            
+            print("\n--- 3. Train/Validation/Test Split ---")
+            X_train, y_train, X_val, y_val, X_test, y_test, train_df, val_df, test_df = split_data(data_full, initial_features, END_DATE_TRAIN_VAL)
+            
+            print("\n--- 4. Feature Scaling ---")
+            X_train_scaled_df, X_val_scaled_df, X_test_scaled_df, scaler = scale_features(X_train, X_val, X_test)
+            
+            print("\n--- 5. Feature Selection Funnelling Approach ---")
+            X_train_final, X_val_final, X_test_final, final_selected_features = select_features(X_train_scaled_df, X_val_scaled_df, X_test_scaled_df, y_train)
+            
+            print("\n--- 6. Model Building and Hyperparameter Tuning ---")
+            tuned_model, best_params = tune_and_train_model(X_train_final, X_val_final, y_train, y_val, RANDOM_SEED, N_OPTUNA_TRIALS, OPTUNA_CV_SPLITS)
+            
+            print("\n--- 7. Model Evaluation on Test Set ---")
+            eval_result = evaluate_model(tuned_model, X_test_final, y_test, display_plot=False)
+            
+            print("\n--- 8. Backtesting the Predicted Signals ---")
+            backtest_results = run_backtest(test_df, eval_result.get("probabilities"), SYMBOL, BACKTEST_PROB_THRESHOLD, RISK_FREE_RATE_ANNUAL, display_plot=False)
+            
+            # Save model artifacts after successful backtesting
+            save_model_artifacts(tuned_model, scaler, final_selected_features, best_params)
+            
+            logger.info("Backtesting completed successfully")
     except KeyboardInterrupt:
-        print("KeyboardInterrupt received. Shutting down...")
+        logger.info("KeyboardInterrupt received. Shutting down...")
         stop_event.set()
         exit_all_positions()
-        ws_thread.join()
-        trading_thread.join()
-        print("Strategy shutdown complete.")
-
-# Add at the end of the file, after the existing main execution block
-if __name__ == "__main__":
-    # Check if we want to run backtesting or live trading
-    import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "--live":
-        run_live_trading()
-    else:
-        # Run the existing backtesting code
-        print("--- 1. Data Acquisition and Initial Preparation ---")
-        data_full = fetch_historical_data(
-            client=client,
-            symbol=SYMBOL,
-            exchange=EXCHANGE,
-            interval=INTERVAL,
-            start_date=START_DATE,
-            end_date=END_DATE_TEST
-        )
-        
-        data_full = prepare_target_variable(data_full, DEAD_ZONE_UPPER, DEAD_ZONE_LOWER)
-        
-        print("\n--- 2. Feature Engineering ---")
-        data_full, initial_features = engineer_features(data_full)
-        
-        print("\n--- 3. Train/Validation/Test Split ---")
-        X_train, y_train, X_val, y_val, X_test, y_test, train_df, val_df, test_df = split_data(data_full, initial_features, END_DATE_TRAIN_VAL)
-        
-        print("\n--- 4. Feature Scaling ---")
-        X_train_scaled_df, X_val_scaled_df, X_test_scaled_df, scaler = scale_features(X_train, X_val, X_test)
-        
-        print("\n--- 5. Feature Selection Funnelling Approach ---")
-        X_train_final, X_val_final, X_test_final, final_selected_features = select_features(X_train_scaled_df, X_val_scaled_df, X_test_scaled_df, y_train)
-        
-        print("\n--- 6. Model Building and Hyperparameter Tuning ---")
-        tuned_model, best_params = tune_and_train_model(X_train_final, X_val_final, y_train, y_val, RANDOM_SEED, N_OPTUNA_TRIALS, OPTUNA_CV_SPLITS)
-        
-        print("\n--- 7. Model Evaluation on Test Set ---")
-        eval_result = evaluate_model(tuned_model, X_test_final, y_test, display_plot=False)
-        
-        print("\n--- 8. Backtesting the Predicted Signals ---")
-        backtest_results = run_backtest(test_df, eval_result.get("probabilities"), SYMBOL, BACKTEST_PROB_THRESHOLD, RISK_FREE_RATE_ANNUAL, display_plot=False)
+    except Exception as e:
+        logger.error(f"Fatal error in main execution: {str(e)}\n{traceback.format_exc()}")
+        sys.exit(1)
 
 
 

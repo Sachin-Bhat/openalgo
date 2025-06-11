@@ -2,13 +2,13 @@ import threading
 import time
 import signal
 import pandas as pd
-import pandas_ta as ta
+import pandas_ta_remake as ta
 from datetime import datetime, timedelta
 from openalgo import api
 
 # Initialize OpenAlgo client
 client = api(
-    api_key="openalgo-api-key",
+    api_key="917dd42d55f63ae8f00117abfbe5b05465fc3bd76a3efbee3be7c085df0be579",
     host="http://127.0.0.1:5000",
     ws_url="ws://127.0.0.1:8765"
 )
