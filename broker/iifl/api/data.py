@@ -4,23 +4,23 @@ import urllib.parse
 from database.token_db import get_br_symbol, get_oa_symbol, get_brexchange
 from broker.iifl.database.master_contract_db import SymToken, db_session
 from flask import session  
-import logging
 import pandas as pd
 from datetime import datetime, timedelta
 from utils.httpx_client import get_httpx_client
 from database.auth_db import get_feed_token
 from broker.iifl.baseurl import MARKET_DATA_URL
 import pytz
+from utils.logging import get_logger
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
+
+
+
 
 def get_api_response(endpoint, auth, method="GET", payload='', feed_token=None, params=None):
     AUTH_TOKEN = auth
-    if feed_token:
-        FEED_TOKEN = feed_token
-    print(f"Feed Token: {FEED_TOKEN}")
+    FEED_TOKEN = feed_token
+    logger.info(f"Feed Token: {FEED_TOKEN}")
     
     # Get the shared httpx client with connection pooling
     client = get_httpx_client()
@@ -71,7 +71,7 @@ def get_api_response(endpoint, auth, method="GET", payload='', feed_token=None, 
         return response.json()
 
     except Exception as e:
-        logger.error(f"API request failed: {str(e)}")
+        logger.exception(f"API request failed: {e}")
         raise
 
 class BrokerData:
@@ -163,8 +163,8 @@ class BrokerData:
         }
             
         except Exception as e:
-            logger.error(f"Error fetching quotes: {str(e)}")
-            raise Exception(f"Error fetching quotes: {str(e)}")
+            logger.exception(f"Error fetching quotes: {e}")
+            raise Exception(f"Error fetching quotes: {e}")
 
     def get_history(self, symbol, exchange, timeframe, from_date, to_date):
         """Get historical data for a symbol"""
@@ -253,7 +253,7 @@ class BrokerData:
                 response = get_api_response("/instruments/ohlc", self.auth_token, method="GET", feed_token=self.feed_token, params=params)
 
                 if not response or response.get('type') != 'success':
-                    logger.error(f"API Response: {response}")
+                    logger.error(f"API Response for ohlc: {response}")
                     raise Exception(f"Error from CompositEdge API: {response.get('description', 'Unknown error')}")
 
                 # Parse dataResponse (pipe-delimited string)
@@ -304,7 +304,7 @@ class BrokerData:
 
                     # Determine segment ID based on exchange
                     segment_id = exchange_segment_map.get(exchange)
-                    print(f"Exchange: {exchange}, Segment ID: {segment_id}")
+                    logger.info(f"Exchange: {exchange}, Segment ID: {segment_id}")
                     if segment_id is None:
                         raise ValueError(f"Unknown exchange: {exchange}")
                     payload = {
@@ -390,8 +390,8 @@ class BrokerData:
 
 
         except Exception as e:
-            logger.error(f"Error fetching historical data: {str(e)}")
-            raise Exception(f"Error fetching historical data: {str(e)}")
+            logger.exception(f"Error fetching historical data: {e}")
+            raise Exception(f"Error fetching historical data: {e}")
 
     def get_intervals(self) -> list:
         """Get available intervals/timeframes for historical data

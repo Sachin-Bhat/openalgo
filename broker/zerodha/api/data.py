@@ -3,14 +3,15 @@ import os
 import urllib.parse
 from database.token_db import get_br_symbol, get_oa_symbol
 from broker.zerodha.database.master_contract_db import SymToken, db_session
-import logging
 import pandas as pd
 from datetime import datetime, timedelta
 from utils.httpx_client import get_httpx_client
+from utils.logging import get_logger
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
+
+
+
 
 class ZerodhaPermissionError(Exception):
     """Custom exception for Zerodha API permission errors"""
@@ -115,7 +116,7 @@ def get_api_response(endpoint, auth, method="GET", payload=None):
         raise
     except Exception as e:
         error_msg = str(e)
-        logger.error(f"API request failed: {error_msg}")
+        logger.exception(f"API request failed: {error_msg}")
         
         # Try to extract more error details if available
         try:
@@ -239,11 +240,11 @@ class BrokerData:
             }
             
         except ZerodhaPermissionError as e:
-            logger.error(f"Permission error fetching quotes: {str(e)}")
+            logger.exception(f"Permission error fetching quotes: {e}")
             raise
         except (ZerodhaAPIError, Exception) as e:
-            logger.error(f"Error fetching quotes: {str(e)}")
-            raise ZerodhaAPIError(f"Error fetching quotes: {str(e)}")
+            logger.exception(f"Error fetching quotes: {e}")
+            raise ZerodhaAPIError(f"Error fetching quotes: {e}")
 
     def get_history(self, symbol: str, exchange: str, timeframe: str, from_date: str, to_date: str) -> pd.DataFrame:
         """
@@ -349,11 +350,11 @@ class BrokerData:
             return final_df
                 
         except ZerodhaPermissionError as e:
-            logger.error(f"Permission error fetching historical data: {str(e)}")
+            logger.exception(f"Permission error fetching historical data: {e}")
             raise
         except (ZerodhaAPIError, Exception) as e:
-            logger.error(f"Error fetching historical data: {str(e)}")
-            raise ZerodhaAPIError(f"Error fetching historical data: {str(e)}")
+            logger.exception(f"Error fetching historical data: {e}")
+            raise ZerodhaAPIError(f"Error fetching historical data: {e}")
 
     def get_market_depth(self, symbol: str, exchange: str) -> dict:
         """
